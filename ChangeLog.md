@@ -1,6 +1,19 @@
 ## Changes between Bunny 3.4.0 and 3.5.0 (in development)
 
-No changes yet.
+### Out-of-order Consumer Acknowledgements
+
+New optional `Bunny::AcknowledgementCoordinator`, available via
+`Bunny::Channel#acknowledgement_coordinator`, coordinates consumer delivery
+acknowledgements that complete out of order, for example when deliveries are
+dispatched to a thread pool. Results are submitted per delivery via credentials
+(`complete`, `reject`, `requeue`). The coordinator emits a cumulative
+`basic.ack` only across the contiguous frontier of resolved deliveries and
+nacks rejected or requeued deliveries individually.
+
+Credentials are bound to the channel incarnation they were issued on: after
+automatic network failure recovery, stale credentials are rejected and can never
+confirm a delivery on the recovered channel that happens to carry the same
+delivery tag.
 
 
 ## Changes between Bunny 3.3.0 and 3.4.0 (Sep 18, 2026)

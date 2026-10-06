@@ -9,6 +9,7 @@ require "bunny/consumer_work_pool"
 require "bunny/exchange"
 require "bunny/queue"
 
+require "bunny/acknowledgement_coordinator"
 require "bunny/delivery_info"
 require "bunny/return_info"
 require "bunny/message_properties"
@@ -212,6 +213,9 @@ module Bunny
 
       @unconfirmed_set_mutex = @connection.mutex_impl.new
 
+      @acknowledgement_coordinator       = nil
+      @acknowledgement_coordinator_mutex = @connection.mutex_impl.new
+
       # Publisher confirm tracking (initialized before reset_continuations)
       @confirms_tracking_enabled = false
       @outstanding_limit = nil
@@ -340,6 +344,7 @@ module Bunny
     # @private
     def connection_closed!
       @status = :closed
+      @acknowledgement_coordinator&.reset!
     end
 
     # @private
@@ -733,6 +738,24 @@ module Bunny
     # @api public
     def nack(delivery_tag, multiple = false, requeue = false)
       basic_nack(delivery_tag.to_i, multiple, requeue)
+    end
+
+    # Returns the acknowledgement coordinator for this channel, creating it
+    # on first use. The coordinator orders consumer delivery
+    # acknowledgements that complete out of order (e.g. when deliveries are
+    # processed by a thread pool) so that a cumulative ack never confirms
+    # deliveries that are still being processed.
+    #
+    # Once a coordinator is used on a channel, route every acknowledgement
+    # on that channel through it.
+    #
+    # @return [Bunny::AcknowledgementCoordinator]
+    # @see Bunny::AcknowledgementCoordinator
+    # @api public
+    def acknowledgement_coordinator
+      @acknowledgement_coordinator_mutex.synchronize do
+        @acknowledgement_coordinator ||= AcknowledgementCoordinator.new(self)
+      end
     end
 
     # @endgroup
@@ -1964,6 +1987,8 @@ module Bunny
       @logger.debug { "Recovering channel #{@id} after network failure" }
       release_all_continuations
 
+      @acknowledgement_coordinator&.reset!
+
       recover_prefetch_setting
       recover_confirm_mode
       recover_tx_mode
@@ -2248,6 +2273,8 @@ module Bunny
 
     # @private
     def handle_frameset(basic_deliver, properties, content)
+      @acknowledgement_coordinator&.track(basic_deliver.delivery_tag)
+
       tag = basic_deliver.consumer_tag
       if @last_consumer_tag == tag
         consumer = @last_consumer
