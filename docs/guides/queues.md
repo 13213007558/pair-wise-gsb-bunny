@@ -1031,6 +1031,44 @@ acknowledgements](http://www.rabbitmq.com/extensions.html#negative-acknowledgeme
 please refer to the [RabbitMQ Extensions
 guide](/articles/extensions.html).
 
+### Coordinating Acknowledgements Across Threads
+
+When deliveries are processed on multiple threads (for example, with a
+consumer work pool larger than 1), they tend to finish out of order.
+Acknowledging a later delivery with `multiple: true` would then also
+acknowledge earlier deliveries that are still being processed.
+
+`Bunny::Channel#acknowledgement_coordinator` is an optional coordinator
+that resolves this. Every delivery is resolved through a credential
+obtained from the coordinator, and the coordinator only emits batched
+(`multiple: true`) acknowledgements across a contiguous run of resolved
+deliveries. Rejected and requeued deliveries are nacked individually.
+
+``` ruby
+coordinator = ch.acknowledgement_coordinator
+
+q.subscribe(:manual_ack => true) do |delivery_info, properties, payload|
+  credential = coordinator.track(delivery_info.delivery_tag)
+  work_pool.post do
+    begin
+      process(delivery_info, properties, payload)
+      credential.ack
+    rescue TransientError
+      credential.requeue
+    rescue
+      credential.reject
+    end
+  end
+end
+```
+
+Delivery tags are scoped to a channel, so a single coordinator covers
+all consumers that share the channel. Credentials are bound to the
+current channel session: after an automatic connection recovery,
+credentials issued before the recovery are rejected with
+`Bunny::StaleDeliveryCredential` instead of acknowledging an unrelated
+delivery that happens to carry the same tag.
+
 ### QoS — Prefetching messages
 
 For cases when multiple consumers share a queue, it is useful to be

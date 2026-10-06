@@ -6,6 +6,8 @@ require "set"
 require "bunny/concurrent/atomic_fixnum"
 require "bunny/consumer_work_pool"
 
+require "bunny/acknowledgement_coordinator"
+
 require "bunny/exchange"
 require "bunny/queue"
 
@@ -143,6 +145,10 @@ module Bunny
     # This will be set to the current sequence index during automatic network failure recovery
     # to keep the sequence monotonic for the user and abstract the reset from the protocol
     attr_reader :delivery_tag_offset
+    # @return [Integer] Incremented every time this channel is (re)opened, including
+    # automatic connection recovery. Used by {Bunny::AcknowledgementCoordinator} to
+    # tell deliveries of the current channel session apart from those of a previous one.
+    attr_reader :acknowledgement_epoch
     # @return [Hash<String, Bunny::Queue>] Queue instances declared on this channel
     attr_reader :queues
     # @return [Hash<String, Bunny::Exchange>] Exchange instances declared on this channel
@@ -232,6 +238,7 @@ module Bunny
 
       @next_publish_seq_no = 0
       @delivery_tag_offset = 0
+      @acknowledgement_epoch = 0
 
       @uncaught_exception_handler = Proc.new do |e, consumer|
         @logger.error "Uncaught exception from consumer #{consumer.to_s}: #{e.inspect} @ #{e.backtrace[0]}"
@@ -252,6 +259,8 @@ module Bunny
     # @return [Bunny::Channel] Self
     # @api public
     def open
+      @acknowledgement_epoch += 1
+
       @threads_waiting_on_continuations           = Set.new
       @threads_waiting_on_confirms_continuations  = Set.new
       @threads_waiting_on_basic_get_continuations = Set.new
@@ -733,6 +742,23 @@ module Bunny
     # @api public
     def nack(delivery_tag, multiple = false, requeue = false)
       basic_nack(delivery_tag.to_i, multiple, requeue)
+    end
+
+    # Returns the acknowledgement coordinator for this channel, creating
+    # it on first use. The coordinator lets applications that process
+    # deliveries on multiple threads resolve them in any order while
+    # still emitting safe batched (multiple: true) acknowledgements.
+    #
+    # Obtain it before starting consumers: once it exists, every
+    # delivery dispatched on this channel is tracked automatically.
+    #
+    # @return [Bunny::AcknowledgementCoordinator]
+    # @see Bunny::AcknowledgementCoordinator
+    # @api public
+    def acknowledgement_coordinator
+      @consumer_mutex.synchronize do
+        @acknowledgement_coordinator ||= AcknowledgementCoordinator.new(self)
+      end
     end
 
     # @endgroup
@@ -2258,6 +2284,10 @@ module Bunny
       end
 
       if consumer
+        # track the delivery before dispatching it to the work pool so
+        # that registration happens in delivery (tag) order even when
+        # consumers process deliveries concurrently
+        @acknowledgement_coordinator&.track(basic_deliver.delivery_tag)
         @work_pool.submit do
           deliver_to_consumer(consumer, basic_deliver, properties, content)
         end

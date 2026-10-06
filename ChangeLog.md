@@ -1,6 +1,17 @@
 ## Changes between Bunny 3.4.0 and 3.5.0 (in development)
 
-No changes yet.
+### Consumer Acknowledgement Coordinator
+
+`Bunny::Channel#acknowledgement_coordinator` is a new optional coordinator for
+consumer acknowledgements. It lets applications process deliveries concurrently
+(for example, on a multi-threaded consumer work pool) and resolve them in any
+order while still emitting safe batched (`multiple: true`) acknowledgements.
+
+Deliveries are resolved through per-delivery credentials (`ack`, `reject`,
+`requeue`). The coordinator only advances its acknowledgement frontier across
+a contiguous run of resolved deliveries, nacks rejected deliveries
+individually, and rejects credentials issued before an automatic connection
+recovery with `Bunny::StaleDeliveryCredential`.
 
 
 ## Changes between Bunny 3.3.0 and 3.4.0 (Sep 18, 2026)

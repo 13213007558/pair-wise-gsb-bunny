@@ -224,6 +224,15 @@ module Bunny
     end
   end
 
+  # Raised when a delivery credential from a previous channel
+  # session (e.g. from before an automatic connection recovery)
+  # is used to resolve a delivery. Delivery tags are scoped to
+  # a channel session, so such credentials must not be used to
+  # acknowledge deliveries on a recovered channel.
+  # @api public
+  class StaleDeliveryCredential < Exception
+  end
+
   # Raised when RabbitMQ responds with 406 PRECONDITION_FAILED
   class PreconditionFailed < ChannelLevelException
   end
