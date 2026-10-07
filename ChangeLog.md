@@ -1,6 +1,16 @@
 ## Changes between Bunny 3.4.0 and 3.5.0 (in development)
 
-No changes yet.
+### Optional Cross-Channel Send Scheduling
+
+Connections can opt into fair body-frame scheduling with
+`cross_channel_send_scheduling: true`. Queued publishes from different channels
+then rotate at body-frame boundaries according to a byte budget configured with
+`cross_channel_send_byte_budget` (65536 bytes by default).
+
+Method and header frames remain indivisible, each message keeps its method,
+header, and body frames in order, and heartbeat frames are scheduled urgently.
+Unfinished content is discarded when the transport is reset and is not migrated
+to a recovered connection.
 
 
 ## Changes between Bunny 3.3.0 and 3.4.0 (Sep 18, 2026)

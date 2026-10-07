@@ -8,6 +8,7 @@ require "bunny/heartbeat_sender"
 require "bunny/reader_loop"
 require "bunny/topology_registry"
 require "bunny/topology_recovery_filter"
+require "bunny/send_scheduler"
 require "bunny/authentication/credentials_encoder"
 require "bunny/authentication/plain_mechanism_encoder"
 require "bunny/authentication/external_mechanism_encoder"
@@ -70,6 +71,8 @@ module Bunny
     # Default reconnection interval for TCP connection failures
     DEFAULT_NETWORK_RECOVERY_INTERVAL = 5.0
 
+    DEFAULT_CROSS_CHANNEL_SEND_BYTE_BUDGET = SendScheduler::DEFAULT_CHANNEL_BYTE_BUDGET
+
     DEFAULT_RECOVERABLE_EXCEPTIONS = [StandardError, TCPConnectionFailedForAllHosts, TCPConnectionFailed, AMQ::Protocol::EmptyResponseError, SystemCallError, Timeout::Error, Bunny::ConnectionLevelException, Bunny::ConnectionClosedError]
 
     #
@@ -77,7 +80,7 @@ module Bunny
     #
 
     # @return [Bunny::Transport]
-    attr_reader :transport
+    attr_reader :transport, :send_scheduler
     attr_reader :status, :heartbeat, :user, :pass, :vhost, :frame_max, :channel_max, :threaded
     attr_reader :server_capabilities, :server_properties, :server_authentication_mechanisms, :server_locales
     attr_reader :channel_id_allocator
@@ -118,6 +121,8 @@ module Bunny
     # @option connection_string_or_opts [Integer] :connection_timeout (30) Timeout in seconds for connecting to the server.
     # @option connection_string_or_opts [Integer] :read_timeout (30) TCP socket read timeout in seconds. If heartbeats are disabled this will be ignored.
     # @option connection_string_or_opts [Integer] :write_timeout (30) TCP socket write timeout in seconds.
+    # @option connection_string_or_opts [Boolean] :cross_channel_send_scheduling (false) Rotate queued body frames between channels by a byte budget.
+    # @option connection_string_or_opts [Integer] :cross_channel_send_byte_budget (65536) Body bytes one channel sends before another queued channel gets a turn.
     # @option connection_string_or_opts [Proc] :hosts_shuffle_strategy a callable that reorders a list of host strings, defaults to Array#shuffle
     # @option connection_string_or_opts [Proc] :recovery_completed a callable that will be called when a network recovery is performed
     # @option connection_string_or_opts [Logger] :logger The logger.  If missing, one is created using :log_file and :log_level.
@@ -215,6 +220,10 @@ module Bunny
       @locale              = @opts.fetch(:locale, DEFAULT_LOCALE)
 
       @mutex_impl          = @opts.fetch(:mutex_impl, Monitor)
+      @cross_channel_send_scheduling = opts.fetch(:cross_channel_send_scheduling, false)
+      @cross_channel_send_byte_budget = normalize_cross_channel_send_byte_budget(
+        opts.fetch(:cross_channel_send_byte_budget, DEFAULT_CROSS_CHANNEL_SEND_BYTE_BUDGET)
+      )
 
       # mutex for the channel id => channel hash
       @channel_mutex       = @mutex_impl.new
@@ -240,7 +249,18 @@ module Bunny
 
       self.reset_continuations
       self.initialize_transport
+      self.initialize_send_scheduler
 
+    end
+
+    def cross_channel_send_scheduling?
+      @cross_channel_send_scheduling
+    end
+
+    def normalize_cross_channel_send_byte_budget(value)
+      value = Integer(value)
+      raise ArgumentError, "cross_channel_send_byte_budget must be positive" if value <= 0
+      value
     end
 
     def validate_connection_options(options)
@@ -699,7 +719,7 @@ module Bunny
     def close_connection(await_response = true)
       if @transport.open?
         @logger.debug "Transport is still open"
-        @transport.send_frame(AMQ::Protocol::Connection::Close.encode(200, "Goodbye", 0, 0))
+        send_frame(AMQ::Protocol::Connection::Close.encode(200, "Goodbye", 0, 0))
 
         if await_response
           @logger.debug "Waiting for a connection.close-ok..."
@@ -1472,6 +1492,7 @@ module Bunny
     # @private
     def close_transport
       begin
+        @send_scheduler&.stop_async
         @transport.close
       rescue StandardError => e
         @logger.error "Exception when closing transport:"
@@ -1494,11 +1515,12 @@ module Bunny
     # @private
     def send_frame(frame, signal_activity = true)
       if open?
-        # @transport_mutex.synchronize do
-        #   @transport.write(frame.encode)
-        # end
-        @transport.write(frame.encode)
-        signal_activity! if signal_activity
+        if @send_scheduler
+          @send_scheduler.send_frame(frame, signal_activity: signal_activity)
+        else
+          @transport.write(frame.encode)
+          signal_activity! if signal_activity
+        end
       else
         raise ConnectionClosedError.new(frame)
       end
@@ -1512,8 +1534,12 @@ module Bunny
     # @private
     def send_frame_without_timeout(frame, signal_activity = true)
       if open?
-        @transport.write_without_timeout(frame.encode)
-        signal_activity! if signal_activity
+        if @send_scheduler
+          @send_scheduler.send_frame(frame, signal_activity: signal_activity)
+        else
+          @transport.write_without_timeout(frame.encode)
+          signal_activity! if signal_activity
+        end
       else
         raise ConnectionClosedError.new(frame)
       end
@@ -1534,9 +1560,13 @@ module Bunny
       channel.synchronize do
         # see rabbitmq/rabbitmq-server#156
         if open?
-          data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
-          @transport.write(data)
-          signal_activity!
+          if @send_scheduler
+            @send_scheduler.send_frames(frames, signal_activity: true, wait: false)
+          else
+            data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
+            @transport.write(data)
+            signal_activity!
+          end
         else
           raise ConnectionClosedError.new(frames)
         end
@@ -1556,9 +1586,13 @@ module Bunny
       # locking. See a note about "single frame" methods in a comment in `send_frameset`. MK.
       channel.synchronize do
         if open?
-          data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
-          @transport.write_without_timeout(data)
-          signal_activity!
+          if @send_scheduler
+            @send_scheduler.send_frames(frames, signal_activity: true, wait: false)
+          else
+            data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
+            @transport.write_without_timeout(data)
+            signal_activity!
+          end
         else
           raise ConnectionClosedError.new(frames)
         end
@@ -1721,6 +1755,7 @@ module Bunny
       end
 
       @status_mutex.synchronize { @status = :open }
+      @send_scheduler.start if @cross_channel_send_scheduling
       if @heartbeat && @heartbeat > 0
         initialize_heartbeat_sender
       else
@@ -1747,7 +1782,8 @@ module Bunny
     def initialize_heartbeat_sender
       maybe_shutdown_heartbeat_sender
       @logger.debug "Initializing heartbeat sender..."
-      @heartbeat_sender = HeartbeatSender.new(@transport, @logger)
+      heartbeat_writer = @send_scheduler || @transport
+      @heartbeat_sender = HeartbeatSender.new(heartbeat_writer, @logger)
       @heartbeat_sender.start(@heartbeat)
     end
 
@@ -1762,6 +1798,7 @@ module Bunny
       if address
         @transport_mutex.synchronize do
           @address_index_mutex.synchronize { @address_index += 1 }
+          @send_scheduler&.reset
           @transport.close rescue nil # Let's make sure the previous transport socket is closed
           @transport = Transport.new(self,
                                      host_from_address(address),
@@ -1777,6 +1814,27 @@ module Bunny
       else
         raise HostListDepleted
       end
+    end
+
+    # @private
+    def initialize_send_scheduler
+      return unless @cross_channel_send_scheduling
+
+      @send_scheduler = SendScheduler.new(-> { @transport },
+                                          @cross_channel_send_byte_budget,
+                                          method(:signal_activity!),
+                                          method(:handle_scheduler_network_failure))
+    end
+
+    # @private
+    def reset_send_scheduler
+      @send_scheduler&.reset
+    end
+
+    # @private
+    def handle_scheduler_network_failure(error)
+      reset_send_scheduler
+      handle_network_failure(error)
     end
 
     # @private

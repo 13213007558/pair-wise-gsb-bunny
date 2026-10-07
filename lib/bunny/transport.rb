@@ -164,19 +164,11 @@ module Bunny
       begin
         if open?
           @writes_mutex.synchronize do
-            @socket.write_nonblock_fully(data, @write_timeout)
+            @socket.write_nonblock_fully(data.dup, @write_timeout)
           end
         end
       rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
-        @logger.error "Got an exception when sending data: #{e.message} (#{e.class.name})"
-        close
-        @status = :not_connected
-
-        if @session.automatically_recover?
-          @session.handle_network_failure(e)
-        else
-          @session_error_handler.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
-        end
+        handle_write_error(e)
       end
     end
 
@@ -188,15 +180,30 @@ module Bunny
           @socket.flush
         end
       rescue SystemCallError, Bunny::ConnectionError, IOError => e
-        close
-        raise e if raise_exceptions
+        handle_write_error(e, raise_exceptions)
+      end
+    end
 
-        if @session.automatically_recover?
-          @session.handle_network_failure(e)
-        else
-          @session_error_handler.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
+    def write_some(data, offset, limit = nil)
+      raise IOError if data.nil? || !open?
+
+      payload = data.byteslice(offset, limit || data.bytesize - offset)
+      total = 0
+
+      @writes_mutex.synchronize do
+        while total < payload.bytesize
+          chunk = payload.byteslice(total, payload.bytesize - total)
+          total += if @write_timeout
+                     @socket.write_nonblock_up_to(chunk, chunk.bytesize, @write_timeout)
+                   else
+                     @socket.write_nonblock(chunk)
+                   end
         end
       end
+      total
+    rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
+      handle_scheduler_write_error(e)
+      raise e
     end
 
     # Sends frame to the peer.
@@ -223,6 +230,10 @@ module Bunny
       end
     end
 
+    def write_heartbeat
+      write_without_timeout(AMQ::Protocol::HeartbeatFrame.encode, true)
+    end
+
 
     def close(reason = nil)
       @socket.close if open?
@@ -238,6 +249,29 @@ module Bunny
 
     def flush
       @socket.flush if @socket
+    end
+
+    private
+
+    def handle_scheduler_write_error(error)
+      @logger.error "Got an exception when sending data: #{error.message} (#{error.class.name})"
+      close
+      @status = :not_connected
+      raise error
+    end
+
+    def handle_write_error(error, raise_exceptions = false)
+      @logger.error "Got an exception when sending data: #{error.message} (#{error.class.name})"
+      close
+      @status = :not_connected
+
+      raise error if raise_exceptions
+
+      if @session.automatically_recover?
+        @session.handle_network_failure(error)
+      else
+        @session_error_handler.raise(Bunny::NetworkFailure.new("detected a network failure: #{error.message}", error))
+      end
     end
 
     def read_fully(count)

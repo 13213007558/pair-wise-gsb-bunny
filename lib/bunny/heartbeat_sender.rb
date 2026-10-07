@@ -13,8 +13,8 @@ module Bunny
     # API
     #
 
-    def initialize(transport, logger)
-      @transport = transport
+    def initialize(writer, logger)
+      @writer = writer
       @logger    = logger
       @mutex     = Monitor.new
 
@@ -65,7 +65,7 @@ module Bunny
 
       if now > (@last_activity_time + @interval)
         @logger.debug { "Sending a heartbeat, last activity time: #{@last_activity_time}, interval (s): #{@interval}" }
-        @transport.write_without_timeout(AMQ::Protocol::HeartbeatFrame.encode, true)
+        @writer.write_heartbeat
       end
     end
   end

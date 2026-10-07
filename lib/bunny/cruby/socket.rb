@@ -129,5 +129,21 @@ module Bunny
 
     end
 
+    def write_nonblock_up_to(data, limit, timeout = nil)
+      raise IOError, "detected a network failure in Bunny (the socket was marked closed)" if @__bunny_socket_eof_flag__
+
+      chunk = data.byteslice(0, [limit, data.bytesize].min)
+
+      begin
+        self.write_nonblock(chunk)
+      rescue *WRITE_RETRY_EXCEPTION_CLASSES
+        if IO.select([], [self], nil, timeout)
+          retry
+        else
+          raise Timeout::Error, "IO timeout when writing to socket"
+        end
+      end
+    end
+
   end
 end

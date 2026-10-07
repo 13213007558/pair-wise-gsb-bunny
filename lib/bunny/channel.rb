@@ -877,8 +877,6 @@ module Bunny
         end
       end
 
-      # Encode all messages into a single buffer and write once
-      data = +""
       payloads.each do |payload|
         frames = AMQ::Protocol::Basic::Publish.encode(@id,
           payload,
@@ -888,9 +886,8 @@ module Bunny
           opts[:mandatory],
           false,
           @frame_max)
-        frames.each { |frame| data << frame.encode }
+        @connection.send_frameset(frames, self)
       end
-      @connection.send_raw_without_timeout(data, self)
 
       self
     end
