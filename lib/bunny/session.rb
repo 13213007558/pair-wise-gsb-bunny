@@ -69,6 +69,7 @@ module Bunny
 
     # Default reconnection interval for TCP connection failures
     DEFAULT_NETWORK_RECOVERY_INTERVAL = 5.0
+    DEFAULT_WRITE_SCHEDULER_BYTE_BUDGET = 16384
 
     DEFAULT_RECOVERABLE_EXCEPTIONS = [StandardError, TCPConnectionFailedForAllHosts, TCPConnectionFailed, AMQ::Protocol::EmptyResponseError, SystemCallError, Timeout::Error, Bunny::ConnectionLevelException, Bunny::ConnectionClosedError]
 
@@ -91,6 +92,7 @@ module Bunny
     # @return [Integer] Timeout for blocking protocol operations (queue.declare, queue.bind, etc), in milliseconds. Default is 15000.
     attr_reader :continuation_timeout
     attr_reader :network_recovery_interval
+    attr_reader :write_scheduler_byte_budget
     attr_reader :connection_name
     attr_accessor :socket_configurator
     attr_accessor :recoverable_exceptions
@@ -118,6 +120,8 @@ module Bunny
     # @option connection_string_or_opts [Integer] :connection_timeout (30) Timeout in seconds for connecting to the server.
     # @option connection_string_or_opts [Integer] :read_timeout (30) TCP socket read timeout in seconds. If heartbeats are disabled this will be ignored.
     # @option connection_string_or_opts [Integer] :write_timeout (30) TCP socket write timeout in seconds.
+    # @option connection_string_or_opts [Boolean] :cross_channel_write_scheduling (false) Fairly rotates queued body frames across channels.
+    # @option connection_string_or_opts [Integer] :write_scheduler_byte_budget (16384) Per-channel byte allowance used by cross-channel write scheduling.
     # @option connection_string_or_opts [Proc] :hosts_shuffle_strategy a callable that reorders a list of host strings, defaults to Array#shuffle
     # @option connection_string_or_opts [Proc] :recovery_completed a callable that will be called when a network recovery is performed
     # @option connection_string_or_opts [Logger] :logger The logger.  If missing, one is created using :log_file and :log_level.
@@ -193,6 +197,11 @@ module Bunny
       @recover_from_connection_close = opts.fetch(:recover_from_connection_close, true)
       # in ms
       @continuation_timeout   = opts.fetch(:continuation_timeout, DEFAULT_CONTINUATION_TIMEOUT)
+      @cross_channel_write_scheduling = opts.fetch(:cross_channel_write_scheduling, false)
+      @write_scheduler_byte_budget = opts.fetch(:write_scheduler_byte_budget, DEFAULT_WRITE_SCHEDULER_BYTE_BUDGET)
+      if @cross_channel_write_scheduling && (!@write_scheduler_byte_budget.is_a?(Integer) || @write_scheduler_byte_budget <= 8)
+        raise ArgumentError, "write_scheduler_byte_budget must be an integer greater than 8"
+      end
 
       @status             = :not_connected
       @manually_closed    = false
@@ -481,6 +490,19 @@ module Bunny
     # @return [Boolean] true if this connection has automatic recovery from network failure enabled
     def automatically_recover?
       @automatically_recover
+    end
+
+    # @private
+    def cross_channel_write_scheduling?
+      @cross_channel_write_scheduling
+    end
+
+    # @private
+    def publish_frame_max
+      return @frame_max unless @cross_channel_write_scheduling
+      return @write_scheduler_byte_budget if @frame_max.zero?
+
+      [@frame_max, @write_scheduler_byte_budget].min
     end
 
     # Defines a callback that will be executed when RabbitMQ blocks the connection
@@ -1534,8 +1556,12 @@ module Bunny
       channel.synchronize do
         # see rabbitmq/rabbitmq-server#156
         if open?
-          data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
-          @transport.write(data)
+          if @transport.write_scheduler
+            @transport.write_scheduler.schedule_frames(frames)
+          else
+            data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
+            @transport.write(data)
+          end
           signal_activity!
         else
           raise ConnectionClosedError.new(frames)
@@ -1556,8 +1582,12 @@ module Bunny
       # locking. See a note about "single frame" methods in a comment in `send_frameset`. MK.
       channel.synchronize do
         if open?
-          data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
-          @transport.write_without_timeout(data)
+          if @transport.write_scheduler
+            @transport.write_scheduler.schedule_frames(frames)
+          else
+            data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
+            @transport.write_without_timeout(data)
+          end
           signal_activity!
         else
           raise ConnectionClosedError.new(frames)
@@ -1574,7 +1604,11 @@ module Bunny
       # locking. Note that "single frame" methods do not need this kind of synchronization. MK.
       channel.synchronize do
         if open?
-          @transport.write(data)
+          if @transport.write_scheduler
+            @transport.write_scheduler.schedule_data(data)
+          else
+            @transport.write(data)
+          end
           signal_activity!
         else
           raise ConnectionClosedError.new("pre-encoded data (#{data.bytesize} bytes)")

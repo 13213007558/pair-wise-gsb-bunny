@@ -46,6 +46,8 @@ Map options that Bunny will recognize are
  * `:threaded` (boolean, default: `true`): switches to single-threaded connections when set to `false`. Only recommended for apps that only publish messages.
  * `:continuation_timeout` (integer, default: `4000` ms): timeout for client operations that expect a response (e.g. `Bunny::Queue#get`), in *milliseconds*.
  * `:frame_max` (integer, default: `131072`): maximum permissible size of a frame (in bytes) to negotiate with clients. Setting to 0 means "unlimited" but will trigger a bug in some QPid clients. Setting a larger value may improve throughput; setting a smaller value may improve latency.
+ * `:cross_channel_write_scheduling` (boolean, default: `false`): rotates queued body frames between channels using a byte budget instead of letting one large publish monopolize writes
+ * `:write_scheduler_byte_budget` (integer, default: `16384`): per-channel wire-byte allowance used when cross-channel write scheduling is enabled
  * `:auth_mechanism` (string or array, default: `"PLAIN"`): Mechanism to authenticate with the server. Currently supporting `"PLAIN"` and `"EXTERNAL"`.
 
 plus TLS connection parameters covered in [Using TLS (SSL) Connections](/articles/tls.html).

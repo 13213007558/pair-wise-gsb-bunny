@@ -1,6 +1,14 @@
 ## Changes between Bunny 3.4.0 and 3.5.0 (in development)
 
-No changes yet.
+### Optional Cross-Channel Write Scheduling
+
+Large publishes no longer have to monopolize the connection when
+`cross_channel_write_scheduling: true` is used. Body frames from different
+channels are rotated according to a byte budget, while each channel keeps the
+strict method, header, and body ordering of an individual message.
+
+Control frames and heartbeats can still be sent promptly, and partially written
+content is discarded rather than migrated to a recovered transport session.
 
 
 ## Changes between Bunny 3.3.0 and 3.4.0 (Sep 18, 2026)

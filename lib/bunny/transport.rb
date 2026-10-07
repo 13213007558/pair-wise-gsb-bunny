@@ -50,6 +50,7 @@ module Bunny
     TLS_VERSION_ALIASES.freeze
 
     attr_reader :session, :host, :port, :socket, :connect_timeout, :read_timeout, :write_timeout, :disconnect_timeout
+    attr_reader :write_scheduler
     attr_reader :tls_context, :verify_peer, :tls_ca_certificates, :tls_certificate_path, :tls_key_path
 
     def read_timeout=(v)
@@ -80,10 +81,16 @@ module Bunny
       @disconnect_timeout = @write_timeout || @read_timeout || @connect_timeout
 
       @writes_mutex       = @session.mutex_impl.new
+      @write_scheduler    = nil
 
       @socket = nil
 
       prepare_tls_context(opts) if @tls_enabled
+
+      if @session.cross_channel_write_scheduling?
+        @write_scheduler = WriteScheduler.new(method(:write_scheduled),
+                                             @session.write_scheduler_byte_budget)
+      end
     end
 
     def hostname
@@ -136,12 +143,14 @@ module Bunny
           raise e
         end
 
+        @write_scheduler&.start
         @status = :connected
 
         @socket
       else
         # no-op
       end
+      @write_scheduler&.start
     end
 
     def connected?
@@ -180,6 +189,33 @@ module Bunny
       end
     end
 
+    # @private
+    def write_scheduled(data)
+      if closed?
+        raise ConnectionClosedError.new(data)
+      end
+
+      @writes_mutex.synchronize do
+        raise ConnectionClosedError.new(data) unless open?
+
+        if @write_timeout
+          @socket.write_nonblock_fully(data, @write_timeout)
+        else
+          count = @socket.write(data)
+          @socket.flush
+          raise IOError, "socket write completed without writing data" unless count && count.positive?
+          count
+        end
+      end
+    rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
+      abort_write_scheduler
+      if @session.automatically_recover?
+        close unless closed?
+        @session.handle_network_failure(e)
+      end
+      raise
+    end
+
     # Writes data to the socket without timeout checks
     def write_without_timeout(data, raise_exceptions = false)
       begin
@@ -207,7 +243,12 @@ module Bunny
       if closed?
         @session.handle_network_failure(ConnectionClosedError.new(frame)) if @session.automatically_recover?
       else
-        write(frame.encode)
+        data = frame.encode
+        if @write_scheduler && frame_channel(data) > 0
+          @write_scheduler.schedule_frame(frame)
+        else
+          write(data)
+        end
       end
     end
 
@@ -219,13 +260,24 @@ module Bunny
       if closed?
         @session.handle_network_failure(ConnectionClosedError.new(frame)) if @session.automatically_recover?
       else
-        write_without_timeout(frame.encode)
+        data = frame.encode
+        if @write_scheduler && frame_channel(data) > 0
+          @write_scheduler.schedule_frame(frame)
+        else
+          write_without_timeout(data)
+        end
       end
     end
 
 
     def close(reason = nil)
+      abort_write_scheduler
       @socket.close if open?
+    end
+
+    def abort_write_scheduler
+      scheduler, @write_scheduler = @write_scheduler, nil
+      scheduler&.abort(ConnectionClosedError.new("connection was closed while frames were pending"))
     end
 
     def open?
@@ -316,6 +368,12 @@ module Bunny
       ensure
         s.close if s
       end
+    end
+
+    private
+
+    def frame_channel(data)
+      data.byteslice(1, 2).unpack1("n")
     end
 
     class << self

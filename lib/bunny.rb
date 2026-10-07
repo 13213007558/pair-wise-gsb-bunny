@@ -9,6 +9,7 @@ require "amq/protocol/extensions"
 
 require "bunny/framing"
 require "bunny/exceptions"
+require "bunny/write_scheduler"
 
 require "bunny/socket"
 require "bunny/timestamp"
@@ -77,6 +78,8 @@ module Bunny
   # @option connection_string_or_opts [Integer] :connection_timeout (30) Timeout in seconds for connecting to the server.
   # @option connection_string_or_opts [Integer] :read_timeout (30) TCP socket read timeout in seconds. If heartbeats are disabled this will be ignored.
   # @option connection_string_or_opts [Integer] :write_timeout (30) TCP socket write timeout in seconds.
+  # @option connection_string_or_opts [Boolean] :cross_channel_write_scheduling (false) Fairly rotates queued body frames across channels.
+  # @option connection_string_or_opts [Integer] :write_scheduler_byte_budget (16384) Per-channel byte allowance used by cross-channel write scheduling.
   # @option connection_string_or_opts [Proc] :hosts_shuffle_strategy a callable that reorders a list of host strings, defaults to Array#shuffle
   # @option connection_string_or_opts [Proc] :recovery_completed a callable that will be called when a network recovery is performed
   # @option connection_string_or_opts [Logger] :logger The logger.  If missing, one is created using :log_file and :log_level.

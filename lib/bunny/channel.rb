@@ -812,7 +812,7 @@ module Bunny
         routing_key,
         opts[:mandatory],
         false,
-        @frame_max)
+        @connection.publish_frame_max)
       @connection.send_frameset(frames, self)
 
       wait_for_publish_confirm(seq_no, continuation) if continuation
@@ -877,8 +877,6 @@ module Bunny
         end
       end
 
-      # Encode all messages into a single buffer and write once
-      data = +""
       payloads.each do |payload|
         frames = AMQ::Protocol::Basic::Publish.encode(@id,
           payload,
@@ -887,10 +885,15 @@ module Bunny
           routing_key,
           opts[:mandatory],
           false,
-          @frame_max)
-        frames.each { |frame| data << frame.encode }
+          @connection.publish_frame_max)
+        if @connection.cross_channel_write_scheduling?
+          @connection.send_frameset(frames, self)
+        else
+          data ||= +""
+          frames.each { |frame| data << frame.encode }
+        end
       end
-      @connection.send_raw_without_timeout(data, self)
+      @connection.send_raw_without_timeout(data, self) unless @connection.cross_channel_write_scheduling?
 
       self
     end
